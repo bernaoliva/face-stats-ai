@@ -1,0 +1,5 @@
+{
+  "p1": {"name": "Neymar Jr", "team_id": "t1", "team_name": "Al Hilal", "position": "Forward", "shirt_number": 10},
+  "p2": {"name": "Lionel Messi", "team_id": "t2", "team_name": "Inter Miami", "position": "Forward", "shirt_number": 10},
+  "p3": {"name": "Cristiano Ronaldo", "team_id": "t3", "team_name": "Al Nassr", "position": "Forward", "shirt_number": 7}
+}

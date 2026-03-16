@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Data files (large/generated)
+local_players.json
+local_players_enriched.json
+
+# Test images
+test_frames/
+test_single/
+extra_photos/
+*.jpg
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
