@@ -1,7 +1,8 @@
-"""Cliente async para Opta SDAPI com suporte a URL auth e OAuth."""
+"""Cliente async para Opta SDAPI com suporte a OAuth (Stats Perform)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from types import TracebackType
@@ -17,9 +18,10 @@ logger = logging.getLogger(__name__)
 class OptaClient:
     """Cliente async para Opta Sports Data API.
 
-    Suporta dois métodos de autenticação:
-    - url_key: outlet auth key no path da URL (requer IP whitelisting)
-    - oauth: OAuth 2.0 Client Credentials com bearer token
+    Autenticação OAuth:
+      1. SHA512(outletKey + timestamp_ms + secretKey) → hash
+      2. POST hash como Basic auth para /oauth/token/{outletKey}
+      3. Recebe access_token (Bearer) para chamadas SDAPI
     """
 
     def __init__(self, config: OptaConfig | None = None) -> None:
@@ -44,51 +46,54 @@ class OptaClient:
             await self._session.close()
             self._session = None
 
-    # --- Auth ---
+    # --- OAuth ---
 
     async def _ensure_oauth_token(self) -> str:
-        """Obtém ou renova o token OAuth 2.0 via Client Credentials."""
+        """Obtém ou renova o token OAuth via Stats Perform endpoint."""
         if self._oauth_token and time.time() < self._oauth_expires_at - 60:
             return self._oauth_token
 
         assert self._session is not None
+        outlet = self._config.outlet_auth_key
+        secret = self._config.active_secret_key
         endpoint = self._config.oauth_token_endpoint
-        if not endpoint:
-            raise ValueError("OPTA_OAUTH_TOKEN_ENDPOINT não configurado")
 
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": self._config.oauth_client_id,
-            "client_secret": self._config.oauth_client_secret,
-        }
+        if not outlet or not secret:
+            raise ValueError("OPTA_OUTLET_AUTH_KEY e OPTA_SECRET_KEY_1 são obrigatórios")
 
-        logger.info("Renovando token OAuth em %s", endpoint)
+        # SHA512(outletKey + timestamp_ms + secretKey)
+        ts_ms = str(int(time.time() * 1000))
+        hash_value = hashlib.sha512(f"{outlet}{ts_ms}{secret}".encode()).hexdigest()
+
+        url = f"{endpoint}/{outlet}?_fmt=json&_rt=b"
+
+        logger.info("Obtendo token OAuth de %s", endpoint)
         async with self._session.post(
-            endpoint,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            url,
+            data={"grant_type": "client_credentials", "scope": "b2b-feeds-auth"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {hash_value}",
+                "Timestamp": ts_ms,
+            },
         ) as resp:
             resp.raise_for_status()
             body = await resp.json()
 
         self._oauth_token = body["access_token"]
-        self._oauth_expires_at = time.time() + body.get("expires_in", 3600)
-        logger.info("Token OAuth obtido, expira em %ds", body.get("expires_in", 3600))
+        expires_in = int(body.get("expires_in", 3600))
+        self._oauth_expires_at = time.time() + expires_in
+        logger.info("Token OAuth obtido, expira em %ds", expires_in)
         return self._oauth_token
 
     async def _get_headers(self) -> dict[str, str]:
-        """Retorna headers de autenticação conforme o método configurado."""
+        """Retorna headers de autenticação."""
         if self._config.auth_method == "oauth":
             token = await self._ensure_oauth_token()
             return {"Authorization": f"Bearer {token}"}
         return {}
 
-    def _build_url(
-        self,
-        feed: OptaFeed,
-        **kwargs: str | None,
-    ) -> str:
-        """Monta a URL usando o config."""
+    def _build_url(self, feed: OptaFeed, **kwargs: str | None) -> str:
         return self._config.build_url(feed, **kwargs)
 
     # --- Fetch ---
@@ -100,7 +105,7 @@ class OptaClient:
         reraise=True,
     )
     async def _fetch(self, url: str) -> dict:
-        """Faz GET com retry e autenticação."""
+        """Faz GET com retry e autenticação OAuth."""
         assert self._session is not None, "Use OptaClient como async context manager"
         headers = await self._get_headers()
         async with self._session.get(url, headers=headers) as resp:
@@ -117,6 +122,17 @@ class OptaClient:
 
     # --- Feeds ---
 
+    async def get_fixtures(
+        self,
+        competition_id: str | None = None,
+        season_id: str | None = None,
+    ) -> dict:
+        """MATCH — lista de jogos (fixtures)."""
+        comp = competition_id or self._config.competition_id
+        season = season_id or self._config.season_id
+        url = self._build_url(OptaFeed.MATCH, competition_id=comp, season_id=season)
+        return await self._safe_fetch(url)
+
     async def get_match_stats(self, match_id: str) -> dict:
         """MA2 — estatísticas de jogo por jogador."""
         url = self._build_url(OptaFeed.MA2, match_id=match_id)
@@ -129,44 +145,44 @@ class OptaClient:
 
     async def get_season_stats(
         self,
-        competition_id: str,
-        season_id: str,
+        competition_id: str | None = None,
+        season_id: str | None = None,
         team_id: str | None = None,
     ) -> dict:
         """TM4 — stats acumuladas da temporada."""
+        comp = competition_id or self._config.competition_id
+        season = season_id or self._config.season_id
         url = self._build_url(
-            OptaFeed.TM4,
-            competition_id=competition_id,
-            season_id=season_id,
-            team_id=team_id,
+            OptaFeed.TM4, competition_id=comp, season_id=season, team_id=team_id,
         )
         return await self._safe_fetch(url)
 
     async def get_squads(
         self,
-        competition_id: str,
-        season_id: str,
+        competition_id: str | None = None,
+        season_id: str | None = None,
         team_id: str | None = None,
     ) -> dict:
         """TM3 — elencos dos times."""
+        comp = competition_id or self._config.competition_id
+        season = season_id or self._config.season_id
         url = self._build_url(
-            OptaFeed.TM3,
-            competition_id=competition_id,
-            season_id=season_id,
-            team_id=team_id,
+            OptaFeed.TM3, competition_id=comp, season_id=season, team_id=team_id,
         )
         return await self._safe_fetch(url)
 
     async def get_all_player_stats(
         self,
         match_id: str,
-        competition_id: str,
-        season_id: str,
+        competition_id: str | None = None,
+        season_id: str | None = None,
     ) -> tuple[dict, dict, dict]:
         """Orquestra MA2+MA3+TM4 em paralelo."""
+        comp = competition_id or self._config.competition_id
+        season = season_id or self._config.season_id
         ma2, ma3, tm4 = await asyncio.gather(
             self.get_match_stats(match_id),
             self.get_match_events(match_id),
-            self.get_season_stats(competition_id, season_id),
+            self.get_season_stats(comp, season),
         )
         return ma2, ma3, tm4

@@ -44,6 +44,11 @@ class StatsSelector:
         self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
         logger.info("StatsSelector usando provider: %s", self._provider)
 
+    @staticmethod
+    def _stat_array_to_dict(stat_array: list[dict]) -> dict:
+        """Convert Opta stat array [{type, value}, ...] to flat dict."""
+        return {s["type"]: s["value"] for s in stat_array if "type" in s and "value" in s}
+
     def _extract_player_stats_from_opta(
         self,
         player_id: str,
@@ -53,19 +58,37 @@ class StatsSelector:
     ) -> dict:
         stats: dict = {}
 
-        # MA2 — match stats per player
-        for team in ma2.get("matchStats", {}).get("teamStats", []):
-            for player in team.get("playerStats", []):
+        # MA2 — match stats per player (real API format)
+        # Real: liveData.lineUp[].player[].stat = [{type, value}, ...]
+        for team in ma2.get("liveData", {}).get("lineUp", []):
+            for player in team.get("player", []):
                 if player.get("playerId") == player_id:
-                    stats.update(player.get("stats", {}))
+                    stat_list = player.get("stat", [])
+                    if isinstance(stat_list, list):
+                        stats.update(self._stat_array_to_dict(stat_list))
+                    elif isinstance(stat_list, dict):
+                        stats.update(stat_list)
                     break
 
-        # MA3 — event-derived stats (goals, assists, cards)
+        # Mock format fallback: matchStats.teamStats[].playerStats[].stats = {}
+        if not stats:
+            for team in ma2.get("matchStats", {}).get("teamStats", []):
+                for player in team.get("playerStats", []):
+                    if player.get("playerId") == player_id:
+                        stats.update(player.get("stats", {}))
+                        break
+
+        # MA3 — event-derived stats
+        # Real: liveData.event[] with typeId
         goals = 0
         assists = 0
         yellow_cards = 0
         red_cards = 0
-        for event in ma3.get("matchEvents", {}).get("events", []):
+        events = (
+            ma3.get("liveData", {}).get("event", [])
+            or ma3.get("matchEvents", {}).get("events", [])
+        )
+        for event in events:
             if event.get("playerId") != player_id:
                 continue
             etype = event.get("typeId")
@@ -86,14 +109,33 @@ class StatsSelector:
         if red_cards:
             stats["red_cards_in_match"] = red_cards
 
+        # Also extract from goal/card arrays in liveData
+        for goal in ma3.get("liveData", {}).get("goal", []):
+            if goal.get("scorerId") == player_id:
+                stats["goals_in_match"] = stats.get("goals_in_match", 0) + 1
+            if goal.get("assistPlayerId") == player_id:
+                stats["assists_in_match"] = stats.get("assists_in_match", 0) + 1
+
         # TM4 — season stats
-        for team in tm4.get("seasonStats", {}).get("teams", []):
-            for player in team.get("players", []):
+        # Real: liveData.lineUp[].player[].stat = [{type, value}, ...]
+        # or seasonStats.teams[].players[].stats = {}
+        for team in tm4.get("liveData", {}).get("lineUp", []):
+            for player in team.get("player", []):
                 if player.get("playerId") == player_id:
-                    season_stats = player.get("stats", {})
+                    stat_list = player.get("stat", [])
+                    season_stats = self._stat_array_to_dict(stat_list) if isinstance(stat_list, list) else stat_list
                     for k, v in season_stats.items():
                         stats[f"season_{k}"] = v
                     break
+
+        # Mock fallback
+        if not any(k.startswith("season_") for k in stats):
+            for team in tm4.get("seasonStats", {}).get("teams", []):
+                for player in team.get("players", []):
+                    if player.get("playerId") == player_id:
+                        for k, v in player.get("stats", {}).items():
+                            stats[f"season_{k}"] = v
+                        break
 
         return stats
 

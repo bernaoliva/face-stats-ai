@@ -3,19 +3,14 @@
 Scans a folder for extra photos, matches them to existing players by filename,
 and re-averages the stored embeddings to improve recognition accuracy.
 
-Filename matching rules (order tried):
-  1. Exact: "PH Ganso.jpg" → player_id "PH Ganso"
-  2. Underscore-to-space: "PH_Ganso.jpg" → "PH Ganso"
-  3. Accent-insensitive: "Ignacio.jpg" → "Ignácio"
-  4. Prefix match + suffix strip: "Cano_jogo.jpg" → "Cano"
+Supported filename formats:
+  1. "PlayerName.jpg"                    → match by name only
+  2. "PlayerName_TeamName_tm.jpg"        → match by name + team (Transfermarkt)
+  3. "PlayerName_jogo.jpg"               → strip suffix, match by name
+  4. Accent-insensitive: "Ignacio" → "Ignácio"
 
 Usage:
   python -m setup.enrich_db --extra extra_photos/ --db local_players.json
-
-Put photos in extra_photos/ named after the player:
-  extra_photos/Cano_jogo.jpg       → updates "Cano"
-  extra_photos/PH_Ganso.jpg        → updates "PH Ganso"
-  extra_photos/Ignacio_perfil.jpg  → updates "Ignácio"
 """
 from __future__ import annotations
 
@@ -45,45 +40,88 @@ def _normalize(s: str) -> str:
     return s.lower().strip()
 
 
-def _build_lookup(players: list[dict]) -> dict[str, int]:
-    """Map normalized player_id → index in players list."""
-    return {_normalize(p["player_id"]): i for i, p in enumerate(players)}
+def _build_lookup(players: list[dict]) -> dict[str, list[int]]:
+    """Map normalized player_id → list of indices (handles duplicates across teams)."""
+    lookup: dict[str, list[int]] = {}
+    for i, p in enumerate(players):
+        key = _normalize(p["player_id"])
+        lookup.setdefault(key, []).append(i)
+    return lookup
 
 
-def _match_player(stem: str, lookup: dict[str, int]) -> str | None:
-    """Find best player_id match for a photo filename stem."""
-    # Strip common suffixes like _jogo, _2, _perfil, _match, etc.
-    def _candidates(s: str):
-        yield s
-        # strip trailing _word or _number
-        parts = s.rsplit("_", 1)
+def _parse_filename(stem: str) -> tuple[str, str | None]:
+    """Parse filename into (player_name, team_hint).
+
+    Supports:
+      "Cano_Fluminense_tm"  → ("Cano", "Fluminense")
+      "Cano_jogo"           → ("Cano", None)
+      "PH_Ganso"            → ("PH Ganso", None)
+      "Cano"                → ("Cano", None)
+    """
+    # Transfermarkt format: Name_Team_tm
+    if stem.endswith("_tm"):
+        stem = stem[:-3]  # remove _tm
+        # Last part is team name
+        # Find the team by checking known suffixes
+        parts = stem.rsplit("_", 1)
         if len(parts) == 2:
-            yield parts[0]
-        parts = s.rsplit(" ", 1)
-        if len(parts) == 2:
-            yield parts[0]
+            return parts[0], parts[1]
+        return stem, None
 
-    norm_stem = _normalize(stem)
-    for candidate in _candidates(norm_stem):
-        if candidate in lookup:
-            return candidate
+    # Regular format: strip known suffixes
+    for suffix in ["_jogo", "_perfil", "_match", "_bing", "_google"]:
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)], None
+
+    return stem, None
+
+
+def _match_player(
+    name: str, team_hint: str | None, lookup: dict[str, list[int]], players: list[dict]
+) -> int | None:
+    """Find best player index for a photo. Uses team_hint to disambiguate."""
+    norm_name = _normalize(name)
+
+    # Try exact match, then strip trailing word
+    candidates_names = [norm_name]
+    parts = norm_name.rsplit(" ", 1)
+    if len(parts) == 2:
+        candidates_names.append(parts[0])
+
+    for candidate in candidates_names:
+        indices = lookup.get(candidate)
+        if not indices:
+            continue
+
+        if len(indices) == 1 or team_hint is None:
+            return indices[0]
+
+        # Multiple players with same name — use team_hint to pick
+        norm_team = _normalize(team_hint)
+        for idx in indices:
+            player_team = _normalize(players[idx].get("team_name", ""))
+            if norm_team in player_team or player_team in norm_team:
+                return idx
+
+        # No team match — skip to avoid wrong player
+        return None
+
     return None
 
 
-def discover_extra_photos(extra_dir: Path) -> dict[str, list[Path]]:
-    """Map normalized_player_id → list of photo paths."""
-    groups: dict[str, list[Path]] = {}
+def discover_extra_photos(extra_dir: Path) -> list[tuple[Path, str, str | None]]:
+    """Return list of (photo_path, player_name, team_hint)."""
+    results: list[tuple[Path, str, str | None]] = []
     for f in sorted(extra_dir.iterdir()):
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS:
-            key = _normalize(f.stem)
-            groups.setdefault(key, []).append(f)
+            name, team = _parse_filename(f.stem)
+            results.append((f, name, team))
         elif f.is_dir():
-            # subdirectory named after player
-            key = _normalize(f.name)
-            photos = [p for p in sorted(f.iterdir()) if p.suffix.lower() in SUPPORTED_EXTS]
-            if photos:
-                groups.setdefault(key, []).extend(photos)
-    return groups
+            name, team = _parse_filename(f.name)
+            for photo in sorted(f.iterdir()):
+                if photo.suffix.lower() in SUPPORTED_EXTS:
+                    results.append((photo, name, team))
+    return results
 
 
 def enrich_db(extra_dir: str, db_path: str, output_path: str) -> None:
@@ -93,29 +131,32 @@ def enrich_db(extra_dir: str, db_path: str, output_path: str) -> None:
     players: list[dict] = data["players"]
     lookup = _build_lookup(players)
 
-    extra_photos = discover_extra_photos(Path(extra_dir))
-    logger.info("Found %d photo groups in '%s'", len(extra_photos), extra_dir)
+    photos = discover_extra_photos(Path(extra_dir))
+    logger.info("Found %d photos in '%s'", len(photos), extra_dir)
 
     embedder = FaceEmbedder(use_gpu=False)
-    updated = 0
+    updated_indices: set[int] = set()
     skipped_no_match = []
-    skipped_no_face = []
+    skipped_no_face = 0
 
-    for norm_stem, paths in tqdm(extra_photos.items(), desc="Enriching players"):
-        # Try to match to a player
-        matched_key = _match_player(norm_stem, lookup)
-        if matched_key is None:
-            skipped_no_match.append(norm_stem)
+    # Group photos by matched player index
+    player_photos: dict[int, list[Path]] = {}
+    for photo_path, name, team_hint in photos:
+        idx = _match_player(name, team_hint, lookup, players)
+        if idx is None:
+            skipped_no_match.append(f"{name} ({team_hint or '?'})")
             continue
+        player_photos.setdefault(idx, []).append(photo_path)
 
-        idx = lookup[matched_key]
+    logger.info("Matched photos to %d players", len(player_photos))
+
+    for idx, paths in tqdm(player_photos.items(), desc="Enriching players"):
         player = players[idx]
 
         new_embeddings: list[np.ndarray] = []
         for photo_path in paths:
             image = cv2.imread(str(photo_path))
             if image is None:
-                logger.warning("Could not read: %s", photo_path)
                 continue
             emb = embedder.get_embedding(image)
             if emb is not None:
@@ -123,8 +164,7 @@ def enrich_db(extra_dir: str, db_path: str, output_path: str) -> None:
                 if norm > 0:
                     new_embeddings.append(emb / norm)
             else:
-                logger.warning("No face detected in: %s", photo_path)
-                skipped_no_face.append(str(photo_path))
+                skipped_no_face += 1
 
         if not new_embeddings:
             continue
@@ -137,21 +177,16 @@ def enrich_db(extra_dir: str, db_path: str, output_path: str) -> None:
         if norm > 0:
             players[idx]["embedding"] = (mean_emb / norm).tolist()
 
-        logger.info(
-            "Updated '%s' with %d new photo(s) (total averaged: %d)",
-            player["player_id"], len(new_embeddings), len(all_embeddings),
-        )
-        updated += 1
+        updated_indices.add(idx)
 
     data["players"] = players
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-    logger.info("Done. %d players updated. Output: %s", updated, output_path)
+    logger.info("Done. %d players updated. Output: %s", len(updated_indices), output_path)
     if skipped_no_match:
-        logger.warning("No player match found for: %s", ", ".join(skipped_no_match))
-    if skipped_no_face:
-        logger.warning("No face detected in: %s", ", ".join(skipped_no_face))
+        unique = sorted(set(skipped_no_match))
+        logger.warning("No match for %d photos: %s", len(unique), ", ".join(unique[:20]))
 
 
 def main() -> None:
